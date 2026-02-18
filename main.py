@@ -1,222 +1,271 @@
 import os
-import re
 import time
 import asyncio
 import aiohttp
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
+from discord.ui import View, Button
 
-# =======================
-# Secrets
-# =======================
 TOKEN = os.getenv("DISCORD_TOKEN")
-PRICE_CHANNEL_ID_RAW = os.getenv("PRICE_CHANNEL_ID")
+PRICE_CHANNEL_ID = int(os.getenv("PRICE_CHANNEL_ID"))
 
-if not TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN in Secrets.")
-if not PRICE_CHANNEL_ID_RAW or not PRICE_CHANNEL_ID_RAW.isdigit():
-    raise RuntimeError("Missing PRICE_CHANNEL_ID in Secrets.")
+COOLDOWN = 30
+CACHE_TTL = 300
 
-PRICE_CHANNEL_ID = int(PRICE_CHANNEL_ID_RAW)
-
-# =======================
-# Config
-# =======================
-COOLDOWN_SECONDS = 5
-MEMORY_TTL_SECONDS = 15 * 60
-CHOICE_TTL_SECONDS = 60
-MAX_SUGGESTIONS = 5
-EMBED_COLOR = 0x2ecc71
-
-DEFAULT_ALL_CCS = ["TR", "UA", "SA", "BR", "RU", "IN", "AR", "US", "CN"]
-
-# =======================
-# Countries
-# =======================
-COUNTRY_ALIASES = {
-    "sa": "SA", "ksa": "SA", "saudi": "SA", "السعودية": "SA",
-    "tr": "TR", "turkey": "TR", "تركيا": "TR",
-    "ua": "UA", "ukraine": "UA", "أوكرانيا": "UA",
-    "br": "BR", "brazil": "BR", "البرازيل": "BR",
-    "ru": "RU", "russia": "RU", "روسيا": "RU",
-    "in": "IN", "india": "IN", "الهند": "IN",
-    "ar": "AR", "argentina": "AR", "الأرجنتين": "AR",
-    "us": "US", "usa": "US", "america": "US", "أمريكا": "US",
-    "cn": "CN", "china": "CN", "الصين": "CN",
-}
+last_user = {}
+cache = {}
 
 FLAGS = {
-    "SA": "🇸🇦","TR": "🇹🇷","UA": "🇺🇦","BR": "🇧🇷","RU": "🇷🇺",
-    "IN": "🇮🇳","AR": "🇦🇷","US": "🇺🇸","CN": "🇨🇳",
+    "TR":"🇹🇷","SA":"🇸🇦","US":"🇺🇸","AR":"🇦🇷",
+    "IN":"🇮🇳","BR":"🇧🇷","UA":"🇺🇦","RU":"🇷🇺","CN":"🇨🇳"
 }
 
-USD_RATES = {
-    "SAR": 0.266,"TRY": 0.031,"UAH": 0.027,"BRL": 0.20,
-    "RUB": 0.011,"INR": 0.012,"ARS": 0.0011,"USD": 1.0,"CNY": 0.14,
+COUNTRIES = ["TR","SA","US","AR","IN","BR","UA","RU","CN"]
+
+RATES = {
+    "USD":1.0,"TRY":0.031,"SAR":0.266,"ARS":0.0011,
+    "INR":0.012,"BRL":0.20,"UAH":0.027,"RUB":0.011,"CNY":0.14
 }
 
-# =======================
-# State
-# =======================
-last_user_time = {}
-memory = {}
-pending_choice = {}
+def to_usd(v,c):
+    r = RATES.get(c)
+    if not r:
+        return None
+    return round(v*r,2)
 
-# =======================
-# Helpers
-# =======================
-def norm(s): return re.sub(r"\s+"," ",s.strip().lower())
-
-def to_usd(a,c):
-    r = USD_RATES.get(c)
-    return round(a*r,2) if r else None
-
-def should_cooldown(uid):
+def cooldown(uid):
     now=time.time()
-    last=last_user_time.get(uid,0)
-    if now-last<COOLDOWN_SECONDS:
-        return int(COOLDOWN_SECONDS-(now-last))
-    last_user_time[uid]=now
+    last=last_user.get(uid,0)
+    if now-last<COOLDOWN:
+        return int(COOLDOWN-(now-last))
+    last_user[uid]=now
     return 0
 
-def get_memory(uid):
-    m=memory.get(uid)
-    if m and time.time()-m["t"]<MEMORY_TTL_SECONDS: return m
-    memory.pop(uid,None); return None
+def cache_get(key):
+    if key in cache:
+        data,ts=cache[key]
+        if time.time()-ts<CACHE_TTL:
+            return data
+        del cache[key]
+    return None
 
-def set_memory(uid,appid,name):
-    memory[uid]={"appid":appid,"name":name,"t":time.time()}
+def cache_set(key,value):
+    cache[key]=(value,time.time())
 
-def set_pending(uid,items):
-    pending_choice[uid]={"items":items,"t":time.time()}
+# ---------------- Search Game ----------------
+async def search_game(session,query):
+    cached=cache_get("search_"+query)
+    if cached:
+        return cached
 
-def get_pending(uid):
-    p=pending_choice.get(uid)
-    if p and time.time()-p["t"]<CHOICE_TTL_SECONDS: return p
-    pending_choice.pop(uid,None); return None
+    url="https://store.steampowered.com/api/storesearch/"
+    async with session.get(url,params={
+        "term":query,
+        "l":"english",
+        "cc":"US"
+    }) as r:
+        data=await r.json()
 
-# =======================
-# Cleaning Task
-# =======================
-def cleanup_dict(d,ttl):
-    now=time.time()
-    for k,v in list(d.items()):
-        if now-v["t"]>ttl: d.pop(k,None)
+    for item in data.get("items",[]):
+        if item.get("type")=="app":
+            cache_set("search_"+query,(item["id"],item["name"]))
+            return item["id"],item["name"]
 
-# =======================
-# Steam
-# =======================
-async def safe_get(session,url,**kw):
-    try:
-        async with session.get(url,timeout=20,**kw) as r:
-            if r.status!=200: return None
-            return await r.text()
-    except:
+    return None,None
+
+# ---------------- Get Editions ----------------
+async def get_editions(session,appid):
+    url="https://store.steampowered.com/api/appdetails"
+    async with session.get(url,params={
+        "appids":appid,
+        "cc":"US",
+        "l":"english"
+    }) as r:
+        data=await r.json()
+
+    e=data.get(str(appid))
+    if not e or not e.get("success"):
+        return []
+
+    d=e["data"]
+    base_name=d.get("name")
+
+    editions=[(appid,base_name,"app")]
+
+    for group in d.get("package_groups",[]):
+        for sub in group.get("subs",[]):
+            name=sub.get("option_text","")
+            subid=sub.get("packageid")
+
+            if not subid:
+                continue
+
+            # إزالة السعر من النص
+            if " - " in name:
+                name=name.split(" - ")[0].strip()
+
+            lower=name.lower()
+
+            if any(k in lower for k in ["deluxe","premium","ultimate","standard"]):
+                editions.append((subid,name,"package"))
+
+    unique=list(dict.fromkeys(editions))
+    return unique
+
+# ---------------- Fetch Price ----------------
+async def fetch_price(session,item_id,cc,item_type):
+
+    if item_type=="app":
+        url="https://store.steampowered.com/api/appdetails"
+        params={
+            "appids":item_id,
+            "cc":cc,
+            "filters":"price_overview"
+        }
+    else:
+        url="https://store.steampowered.com/api/packagedetails"
+        params={
+            "packageids":item_id,
+            "cc":cc
+        }
+
+    async with session.get(url,params=params) as r:
+        data=await r.json()
+
+    e=data.get(str(item_id))
+    if not e or not e.get("success"):
         return None
 
-async def steam_search(session,q):
-    html=await safe_get(session,"https://store.steampowered.com/search/",params={"term":q})
-    if not html: return []
-    appids=re.findall(r'data-ds-appid="(\d+)"',html)
-    titles=re.findall(r'<span class="title">(.*?)</span>',html)
-    items=[]
-    for i,a in enumerate(appids[:MAX_SUGGESTIONS]):
-        t=titles[i] if i<len(titles) else q
-        items.append((int(a),re.sub("<.*?>","",t)))
-    return items
+    d=e.get("data")
 
-async def steam_price(session,appid,cc):
-    try:
-        async with session.get(
-            "https://store.steampowered.com/api/appdetails",
-            params={"appids":appid,"cc":cc,"filters":"price_overview"},
-            timeout=20) as r:
-            if r.status!=200: return None
-            data=await r.json()
-    except:
+    if item_type=="app":
+        po=d.get("price_overview") if d else None
+    else:
+        po=d.get("price") if d else None
+
+    if not po:
         return None
-
-    entry=data.get(str(appid),{})
-    if not entry.get("success"): return None
-    po=entry["data"].get("price_overview")
-    if not po: return {"available":False}
 
     final=po["final"]/100
     cur=po["currency"]
-    return {
-        "available":True,
-        "final":final,
-        "currency":cur,
-        "usd":to_usd(final,cur),
-        "discount":po.get("discount_percent",0)
-    }
+    usd=to_usd(final,cur)
+    discount=po.get("discount_percent",0)
 
-# =======================
-# Embed
-# =======================
-def build_embed(name,appid,results):
+    if not usd:
+        return None
+
+    return (cc,usd,final,cur,discount)
+
+# ---------------- Get Prices ----------------
+async def get_prices(session,item_id,item_type):
+    tasks=[
+        fetch_price(session,item_id,cc,item_type)
+        for cc in COUNTRIES
+    ]
+    results=await asyncio.gather(*tasks)
+
+    pairs=[p for p in results if p]
+    pairs.sort(key=lambda x:x[1])
+    return pairs
+
+# ---------------- Embed ----------------
+def make_embed(title,prices):
     lines=[]
-    for cc,data in results:
-        f=FLAGS.get(cc,"")
-        if not data:
-            lines.append(f"{f} {cc}: خطأ")
-            continue
-        if not data["available"]:
-            lines.append(f"{f} {cc}: لا يوجد سعر")
-            continue
-        usd=f'≈ {data["usd"]}$' if data["usd"] else ""
-        lines.append(f'{f} {cc}: {data["final"]} {data["currency"]} {usd}')
+    cheapest=None
+
+    for cc,usd,final,cur,discount in prices:
+        flag=FLAGS.get(cc,"")
+        disc=f" (-{discount}%)" if discount else ""
+        lines.append(f"{flag} **{cc}** {final} {cur} → 🟢 {usd}$ {disc}")
+
+        if not cheapest or usd<cheapest[1]:
+            cheapest=(cc,usd)
+
+    cheapest_line=""
+    if cheapest:
+        flag=FLAGS.get(cheapest[0],"")
+        cheapest_line=f"\n\n🔥 **أرخص دولة:** {flag} {cheapest[0]} بسعر {cheapest[1]}$"
+
+    desc="**💵 الأسعار مرتبة من الأرخص للأغلى:**\n\n"+"\n".join(lines)+cheapest_line
 
     return discord.Embed(
-        title=name,
-        description="\n".join(lines),
-        color=EMBED_COLOR
+        title=f"💰 {title}",
+        description=desc,
+        color=0x1E88E5
     )
 
-# =======================
-# Discord
-# =======================
+# ---------------- Discord ----------------
 intents=discord.Intents.default()
 intents.message_content=True
 bot=commands.Bot(command_prefix="!",intents=intents)
 
-@tasks.loop(minutes=10)
-async def cleaner():
-    cleanup_dict(memory,MEMORY_TTL_SECONDS)
-    cleanup_dict(pending_choice,CHOICE_TTL_SECONDS)
+class EditionView(View):
+    def __init__(self,user_id,items):
+        super().__init__(timeout=60)
+        self.user_id=user_id
 
-@bot.event
-async def on_ready():
-    cleaner.start()
-    print("Bot Ready")
+        for item_id,title,item_type in items:
+            btn=Button(label=title[:80],style=discord.ButtonStyle.primary)
+            btn.callback=self.make_callback(item_id,title,item_type)
+            self.add_item(btn)
+
+    def make_callback(self,item_id,title,item_type):
+        async def callback(interaction:discord.Interaction):
+            if interaction.user.id!=self.user_id:
+                await interaction.response.send_message("❌ هذا مو لك",ephemeral=True)
+                return
+
+            await interaction.response.defer()
+
+            async with aiohttp.ClientSession() as s:
+                prices=await get_prices(s,item_id,item_type)
+
+            if not prices:
+                await interaction.followup.send("❌ لا يوجد أسعار متاحة لهذا الإصدار")
+                return
+
+            embed=make_embed(title,prices)
+            await interaction.followup.send(embed=embed)
+
+        return callback
 
 @bot.event
 async def on_message(msg):
-    if msg.author.bot: return
-    await bot.process_commands(msg)
-    if msg.channel.id!=PRICE_CHANNEL_ID: return
-
-    cd=should_cooldown(msg.author.id)
-    if cd>0:
-        await msg.reply(f"استنى {cd} ثواني 😅")
+    if msg.author.bot or msg.channel.id!=PRICE_CHANNEL_ID:
         return
 
-    text=norm(msg.content)
-    if not text: return
+    asyncio.create_task(auto_delete(msg,20))
 
-    await msg.channel.typing()
-    async with aiohttp.ClientSession(headers={"User-Agent":"Mozilla"}) as s:
-        items=await steam_search(s,text)
-        if not items:
-            await msg.reply("ما لقيت شي ❌")
+    cd=cooldown(msg.author.id)
+    if cd>0:
+        m=await msg.reply(f"⏳ انتظر {cd} ثانية")
+        asyncio.create_task(auto_delete(m,15))
+        return
+
+    async with aiohttp.ClientSession() as s:
+        appid,title=await search_game(s,msg.content.strip())
+
+        if not appid:
+            m=await msg.reply("❌ ما لقيت لعبة")
+            asyncio.create_task(auto_delete(m,15))
             return
 
-        appid,title=items[0]
-        set_memory(msg.author.id,appid,title)
+        editions=await get_editions(s,appid)
 
-        results=[]
-        for cc in ["TR","SA"]:
-            data=await steam_price(s,appid,cc)
-            results.append((cc,data))
+    if not editions:
+        m=await msg.reply("❌ لا يوجد إصدارات متاحة")
+        asyncio.create_task(auto_delete(m,15))
+        return
 
-        await msg.reply(embed=build_embed(title,appid,res_
+    view=EditionView(msg.author.id,editions)
+    m=await msg.reply("اختر الإصدار:",view=view)
+    asyncio.create_task(auto_delete(m,60))
+
+async def auto_delete(message,seconds):
+    await asyncio.sleep(seconds)
+    try:
+        await message.delete()
+    except:
+        pass
+
+bot.run(TOKEN)
